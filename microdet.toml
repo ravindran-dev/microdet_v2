@@ -68,7 +68,8 @@ ratio = 0.1
 [schedule.grad_clip]
 max_norm = 1.0
 
-
+[log]
+interval = 20
 [resume]
 path = "runs/microdet_drone/last.pth"
 
