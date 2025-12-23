@@ -1,0 +1,78 @@
+[model]
+name = "microdet"
+nc = 1
+input_size = [512, 512]
+
+
+[model.scales]
+s = [0.50, 0.50, 192]
+
+[[model.backbone]]
+config = [-1, 1, "ShuffleNetV2", ["1.0x", [2, 3, 4], "LeakyReLU", true]]
+
+[[model.neck]]
+config = [0, 1, "GhostPAN", [[116, 232, 464], 96, false, 5, 1.0, 1, false, 0, "bilinear", "LeakyReLU"]]
+
+[[model.head]]
+config = [1, 1, "NanoDetPlusHead", [1, "loss", 96, 96, 2, 5, [8, 16, 32], "DWConv", "BN", 7, "LeakyReLU", "assigner_cfg"]]
+
+
+
+
+[model.head.loss]
+config = [1.0, 0.25, 1.0, 7, "giou"]
+
+
+
+[model.head.assigner_cfg]
+config = ["CenterAssigner", {"8"  = 4.0,"16" = 4.0,"32" = 4.0}]
+
+
+
+[data.train]
+config = [
+    "tmp/data/dataset/images",
+    "tmp/data/dataset/result.json",
+    [640, 640],
+    true,
+    { color_jitter = true }
+]
+
+[data.val]
+config = [
+    "tmp/data/dataset/images",
+    "tmp/data/dataset/result.json",
+    [640, 640],
+    true,
+    {}
+]
+
+class_names = ["person"]
+
+[device]
+config = [2, 4, 32]
+
+[schedule]
+total_epochs = 400
+
+[schedule.optimizer]
+config = ["adamw", 0.0003, 0.05, true, true]
+
+[schedule.lr_schedule]
+config = ["CosineAnnealingLR", 0.00001]
+
+[schedule.warmup]
+steps = 1000
+ratio = 0.1
+
+[schedule.grad_clip]
+max_norm = 1.0
+
+[log]
+interval = 20
+[resume]
+path = "runs/microdet_drone/last.pth"
+
+[save]
+dir = "runs/microdet_drone"
+

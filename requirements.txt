@@ -1,0 +1,13 @@
+torch
+torchvision
+pyyaml
+tqdm
+opencv-python
+numpy
+albumentations
+pycocotools
+scipy
+tensorboard
+matplotlib
+pandas
+
