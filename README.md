@@ -3,6 +3,61 @@
 A lightweight, anchor-free object detection system built using MicroDet, optimized for aerial / drone imagery.
 This project focuses on efficient person detection with minimal computational overhead, making it suitable for edge devices and UAV applications.
 
+---
+
+## Executive Summary
+
+MicroDet delivers efficient, anchor-free person detection for drone imagery with a practical train-validate-infer pipeline.
+The repository is designed for experimentation speed, stable training behavior, and deployment-friendly inference.
+
+| Focus Area | Value |
+| --- | --- |
+| Detection Strategy | Anchor-free regression with DFL |
+| Deployment Goal | Lightweight edge/UAV compatibility |
+| Data Standard | COCO-style annotations |
+| Training Stability | AMP + EMA + configurable assigner/loss |
+
+## Quick Navigation
+
+- [Features](#features)
+- [Project Structure](#project-structure)
+- [Model Overview](#model-overview)
+- [Dataset](#dataset)
+- [Training](#training)
+- [Evaluation](#evaluation)
+- [Inference](#inference)
+- [Configuration Highlights](#configuration-highlights)
+- [Tech Stack](#tech-stack)
+- [Applications](#applications)
+- [Future Work](#future-work)
+- [Author - Ravindran S](#--author---ravindran-s)
+
+## Quick Start Workflow
+
+### 1) Install dependencies
+
+```zsh
+python -m pip install -r requirements.txt
+```
+
+### 2) Configure experiment
+
+Update `microdet.toml` for dataset paths, optimizer settings, assigner radius, and loss options.
+
+### 3) Train and validate
+
+Use the training commands in the Training section to start from scratch or resume from a checkpoint.
+
+### 4) Run inference
+
+Use the inference command in the Inference section to generate visual outputs with NMS-applied detections.
+
+### 5) Review outputs
+
+Check model checkpoints in `runs/microdet_drone/weights/` and logs in `runs/microdet_drone/logs/`.
+
+---
+
 ## Features
 
 - Lightweight MicroDet architecture
