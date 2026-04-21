@@ -1,110 +1,105 @@
 import torch
-from src.src.common_imports  import *
-from src.model.loss.dfl import dfl_decode
-from src.model.module.nms import nms_infer_wrapper
-from src.model.loss.criterion import DetectionCriterion
-from src.train.pred_utils import normalize_preds
+
+from src.model.postprocess import canonicalize_preds, decode_predictions
+
+
+@torch.no_grad()
+def _box_iou_xyxy(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    if a.numel() == 0 or b.numel() == 0:
+        return a.new_zeros((a.size(0), b.size(0)))
+    lt = torch.maximum(a[:, None, :2], b[None, :, :2])
+    rb = torch.minimum(a[:, None, 2:], b[None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+    area_a = (a[:, 2] - a[:, 0]).clamp(min=0) * (a[:, 3] - a[:, 1]).clamp(min=0)
+    area_b = (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
+    return inter / (area_a[:, None] + area_b[None, :] - inter + 1e-6)
+
 
 @torch.no_grad()
 def eval_model(model, val_loader, post_cfg):
     device = next(model.parameters()).device
 
-    conf_thres = float(post_cfg.get("conf_thres", 0.90))
+    conf_thres = float(post_cfg.get("conf_thres", 0.35))
     iou_thres = float(post_cfg.get("iou_thres", 0.50))
-    max_det = int(post_cfg.get("max_det", 50))
-    min_box = int(post_cfg.get("min_box", 12))
+    max_det = int(post_cfg.get("max_det", 100))
+    min_box = float(post_cfg.get("min_box", 8.0))
+    score_temperature = float(post_cfg.get("score_temperature", 1.0))
 
-    for batch in val_loader:
-        images, targets, metas = batch
+    tp = 0
+    fp = 0
+    fn = 0
+    detections = 0
+    score_sum = 0.0
+    n_images = 0
+
+    for images, targets, _ in val_loader:
         images = images.to(device)
+        preds = canonicalize_preds(model(images))
 
-       
-        out = model(images)
-        out = normalize_preds(out)
-
-
-        if isinstance(out, dict):
-            cls_per_level = out["cls_logits"]
-            reg_per_level = out["reg_dfl"]
-        else:
-            cls_per_level = [o["cls"] for o in out]
-            reg_per_level = [o["reg"] for o in out]
-
-        B = images.size(0)
-        all_boxes = []
-        all_scores = []
-
-        for lvl, (cl, rg) in enumerate(zip(cls_per_level, reg_per_level)):
-           
-            _, _, H, W = cl.shape
-            K = rg.shape[1] // 4
-
-            
-            cls_flat = cl.permute(0, 2, 3, 1).reshape(B, -1)         
-            rg_flat = rg.permute(0, 2, 3, 1).reshape(B, -1, 4 * K)   
-
-           
-            ys, xs = torch.meshgrid(
-                torch.arange(H, device=device),
-                torch.arange(W, device=device),
-                indexing="ij"
-            )
-            # Option 1 (recommended): use criterion strides
-            # Get strides from model (head or detect)
-            if hasattr(model, "strides"):
-                strides = model.strides
-            elif hasattr(model, "head") and hasattr(model.head, "strides"):
-                strides = model.head.strides
-            else:
-                raise AttributeError("Could not find strides in model or model.head")
-
-            stride = strides[lvl]
-
-
-            px = (xs + 0.5) * stride
-            py = (ys + 0.5) * stride
-            pts = torch.stack([px.reshape(-1), py.reshape(-1)], dim=1) 
-
-            
-            
-            dist = dfl_decode(rg_flat.reshape(-1, 4 * K), reg_max=K - 1)
-
-            dist = dist.view(B, -1, 4)
-
-            x1 = pts[:, 0][None, :] - dist[:, :, 0]
-            y1 = pts[:, 1][None, :] - dist[:, :, 1]
-            x2 = pts[:, 0][None, :] + dist[:, :, 2]
-            y2 = pts[:, 1][None, :] + dist[:, :, 3]
-
-            boxes = torch.stack([x1, y1, x2, y2], dim=2)
-
-           
-            w = boxes[:, :, 2] - boxes[:, :, 0]
-            h = boxes[:, :, 3] - boxes[:, :, 1]
-            valid = (w >= min_box) & (h >= min_box)
-
-            all_boxes.append(boxes)
-            all_scores.append(cls_flat)
-
-        boxes_cat = torch.cat(all_boxes, dim=1)       
-        scores_cat = torch.cat(all_scores, dim=1)    
-
-        det_boxes, det_scores, det_batch = nms_infer_wrapper(
-            scores_cat.unsqueeze(-1),
-            boxes_cat,
-            conf_thresh=conf_thres,
-            iou_thresh=iou_thres,
+        det_boxes, det_scores, det_batch = decode_predictions(
+            preds,
+            model=model,
+            conf_thres=conf_thres,
+            iou_thres=iou_thres,
             max_det=max_det,
+            min_box=min_box,
+            score_temperature=score_temperature,
         )
 
-        
+        B = images.size(0)
+        n_images += B
+        for bi in range(B):
+            gt = targets[bi].get("boxes", torch.zeros((0, 4), dtype=torch.float32))
+            gt = gt.to(device).float()
 
-   
+            mask = det_batch == bi
+            pb = det_boxes[mask]
+            ps = det_scores[mask]
+
+            detections += int(pb.size(0))
+            score_sum += float(ps.sum().item()) if ps.numel() > 0 else 0.0
+
+            if gt.numel() == 0 and pb.numel() == 0:
+                continue
+            if gt.numel() == 0:
+                fp += int(pb.size(0))
+                continue
+            if pb.numel() == 0:
+                fn += int(gt.size(0))
+                continue
+
+            ious = _box_iou_xyxy(pb, gt)
+            matched_gt = torch.zeros((gt.size(0),), dtype=torch.bool, device=device)
+
+            order = torch.argsort(ps, descending=True)
+            for pi in order:
+                pi = int(pi)
+                max_iou, gidx = ious[pi].max(dim=0)
+                gidx = int(gidx)
+                if max_iou >= 0.5 and not matched_gt[gidx]:
+                    matched_gt[gidx] = True
+                    tp += 1
+                else:
+                    fp += 1
+
+            fn += int((~matched_gt).sum().item())
+
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = (2 * precision * recall) / max(precision + recall, 1e-12)
+    mean_conf = score_sum / max(detections, 1)
+    det_per_img = detections / max(n_images, 1)
+
+    # Keep mAP key for checkpoint selection; AP50 proxy is better than a hardcoded zero.
+    ap50_proxy = precision * recall
+
     return {
-        "mAP": 0.0,
-        "AP50": 0.0,
-        "AP_small": 0.0,
-        "prec@0.90": 0.0,
-        "rec@0.90": 0.0,
-        "FPPF@0.90": 0.0,
+        "mAP": float(ap50_proxy),
+        "AP50": float(ap50_proxy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "mean_conf": float(mean_conf),
+        "det_per_img": float(det_per_img),
     }

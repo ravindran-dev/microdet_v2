@@ -12,14 +12,8 @@ def _stack_images(batch_imgs: List[torch.Tensor]) -> torch.Tensor:
     if isinstance(batch_imgs, torch.Tensor):
         return batch_imgs
 
-    out = None
-    worker_info = torch.utils.data.get_worker_info()
-    if worker_info is not None and len(batch_imgs) > 0:
-        numel = sum(x.numel() for x in batch_imgs)
-        storage = batch_imgs[0].storage()._new_shared(numel)
-        out = batch_imgs[0].new(storage)
-
-    return torch.stack(batch_imgs, 0, out=out)
+    # Modern PyTorch: use direct stacking without deprecated storage methods
+    return torch.stack(batch_imgs, 0)
 
 
 def _to_tensor_from_numpy(arr: np.ndarray) -> torch.Tensor:

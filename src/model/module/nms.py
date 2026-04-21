@@ -1,6 +1,5 @@
 from src.src.common_imports import torch, Tuple, Dict, Optional
 
-1
 def box_area(boxes: torch.Tensor) -> torch.Tensor:
     return (boxes[..., 2] - boxes[..., 0]).clamp_(min=0) * (boxes[..., 3] - boxes[..., 1]).clamp_(min=0)
 
@@ -94,8 +93,11 @@ def nms_infer_wrapper(
     iou_thresh: float = 0.5,
     topk: int = 1000,
     max_det: int = 50,
+    apply_sigmoid: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    scores = torch.sigmoid(cls_logits.squeeze(-1))
+    scores = cls_logits.squeeze(-1)
+    if apply_sigmoid:
+        scores = torch.sigmoid(scores)
     return batched_nms_class_agnostic(decoded_boxes, scores, iou_thresh, conf_thresh, topk, max_det)
 
 

@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 import os
 import time
+import warnings
 from pathlib import Path
 import tomllib
+
+# Suppress non-critical deprecation warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*Failed importing.*fpn.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*TypedStorage is deprecated.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*resized since it had shape.*")
 
 import torch
 import torch.optim as optim
@@ -16,13 +22,13 @@ from src.data.transforms import build_transforms
 from src.model.model_wrapper import MicroDet
 from src.model.weight_averager.ema import ModelEMA
 from src.model.loss.criterion import DetectionCriterion
+from src.model.postprocess import canonicalize_preds
 from src.assigners.center_assigner import CenterAssigner
 from src.train.validate import eval_model
 
 from src.utils.logger import TBLogger, CSVLogger
 from src.utils.profiler import profile_model_once
 from src.utils.seed import set_seed
-from src.train.pred_utils import normalize_preds
 
 def build_dataloaders(cfg, workers: int, batch: int):
     train_cfg = cfg["data"]["train"]["config"]
@@ -97,7 +103,9 @@ def build_optimizer(model, opt_cfg_list):
         for pname, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if any(k in pname.lower() for k in ["bias", "bn", "norm", "ln"]):
+            is_norm = any(k in pname.lower() for k in ["bn", "norm", "ln"])
+            is_bias = "bias" in pname.lower()
+            if (is_norm and no_norm_decay) or (is_bias and no_bias_decay):
                 no_decay.append(p)
             else:
                 decay.append(p)
@@ -387,9 +395,27 @@ def main():
         sd = state["model"] if isinstance(state, dict) and "model" in state else state
         model.load_state_dict(sd, strict=False)
 
+    def _resolve_resume_path(explicit_path: str):
+        if explicit_path:
+            return Path(explicit_path)
+
+        auto_candidates = []
+        cfg_resume = cfg.get("resume", {}).get("path", "")
+        if cfg_resume:
+            auto_candidates.append(Path(cfg_resume))
+        auto_candidates.append(save_dir / "weights" / "last.ckpt")
+
+        for p in auto_candidates:
+            if p.is_file():
+                return p
+        return None
+
+    best_map = -1.0
     start_epoch = 0
-    if cli_args.resume and os.path.isfile(cli_args.resume):
-        ckpt = torch.load(cli_args.resume, map_location="cpu")
+    resume_path = _resolve_resume_path(cli_args.resume)
+    if resume_path is not None:
+        print(f"[RESUME] Loading checkpoint: {resume_path}")
+        ckpt = torch.load(str(resume_path), map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=True)
         if ckpt.get("optimizer"):
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -398,6 +424,8 @@ def main():
         if ema is not None and ckpt.get("ema"):
             ema.load_state_dict(ckpt["ema"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_map = float(ckpt.get("best_metric", -1.0))
+        print(f"[RESUME] Continue from epoch {start_epoch + 1} | best mAP={best_map:.4f}")
 
     tb = TBLogger(save_dir / "tb")
     csv = CSVLogger(save_dir / "logs" / "scalars.csv")
@@ -406,8 +434,16 @@ def main():
 
     total_epochs = int(cfg["schedule"]["total_epochs"])
     val_interval = int(cfg["schedule"].get("val_interval", 5))
-    best_map = -1.0
     global_step = start_epoch * len(train_loader)
+
+    if start_epoch >= total_epochs:
+        print(
+            f"[RESUME] Checkpoint epoch is already at/after total_epochs "
+            f"({start_epoch}/{total_epochs}). Nothing to train."
+        )
+        tb.close()
+        csv.close()
+        return
 
     for epoch in range(start_epoch, total_epochs):
         model.train()
@@ -445,10 +481,14 @@ def main():
 
             with autocast(device_type="cuda", enabled=amp_enabled):
                 raw_preds = model(images)
-                
-                preds = normalize_preds(raw_preds)
+                preds = canonicalize_preds(raw_preds)
 
                 loss_total, loss_qfl, loss_dfl, loss_box = criterion(preds, targets)
+
+            if not torch.isfinite(loss_total):
+                print(f"[warn] non-finite loss at epoch={epoch} iter={it}; skipping step")
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             scaler.scale(loss_total).backward()
 
@@ -493,39 +533,37 @@ def main():
             f"time {dt:.1f}s"
         )
 
+        # Persist training state each epoch so resume can continue from the exact last finished epoch.
+        save_checkpoint(
+            save_dir / "weights" / "last.ckpt",
+            model,
+            optimizer,
+            scheduler,
+            ema,
+            epoch,
+            best_map,
+        )
+
         if (epoch + 1) % val_interval == 0 or (epoch + 1) == total_epochs:
             eval_model_to_use = ema.ema if ema is not None else model
             eval_model_to_use.eval()
 
             with torch.no_grad():
+                post_cfg = cfg.get("postprocess", {})
                 metrics = eval_model(
                     eval_model_to_use,
                     val_loader,
                     post_cfg={
-                        "conf_thres": 0.90,
-                        "iou_thres": 0.50,
-                        "max_det": 50,
-                        "min_box": 12,
+                        "conf_thres": float(post_cfg.get("conf_thres", 0.35)),
+                        "iou_thres": float(post_cfg.get("iou_thres", 0.50)),
+                        "max_det": int(post_cfg.get("max_det", 100)),
+                        "min_box": float(post_cfg.get("min_box", 8.0)),
+                        "score_temperature": float(post_cfg.get("score_temperature", 1.0)),
                     },
                 )
 
             mAP = float(metrics.get("mAP", -1.0))
             print(f"Val epoch {epoch+1}: mAP={mAP:.4f}")
-
-            save_checkpoint(
-                save_dir / "weights" / "last.ckpt",
-                model,
-                optimizer,
-                scheduler,
-                ema,
-                epoch,
-                best_map,
-            )
-            print(
-                f"Epoch {epoch+1}/{total_epochs} | "
-                f"loss {epoch_loss/len(train_loader):.4f} | "
-                f"time {dt:.1f}s"
-            )
 
             if mAP > best_map:
                 best_map = mAP

@@ -1,168 +1,97 @@
-import torch
-import torch.nn.functional as F
+import argparse
+from pathlib import Path
+
 import cv2
-import tomllib
 import numpy as np
-from torchvision.ops import nms
+import torch
+import tomllib
 
+from src.data.transforms import _letterbox_any
 from src.model.model_wrapper import MicroDet
-from src.train.train import _normalize_preds_for_criterion
+from src.model.postprocess import canonicalize_preds, decode_predictions, undo_letterbox
 
 
-# ================= CONFIG =================
-CFG_PATH = "microdet.toml"
-CKPT_PATH = "runs/microdet_drone/weights/last.ckpt"
-IMAGE_PATH = "tmp/infer/image.png"
-OUT_PATH = "tmp/infer/output.png"
+def preprocess_image(image_path: str, input_size=(640, 640)):
+    img_bgr = cv2.imread(image_path)
+    if img_bgr is None:
+        raise FileNotFoundError(f"Image not found: {image_path}")
 
-CONF_THRES = 0.30          # IMPORTANT (after retraining)
-NMS_IOU_THRES = 0.5
-STRIDES = [8, 16, 32]      # must match training
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# ==========================================
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_lb, lb_meta = _letterbox_any(img_rgb, input_size)
+    img_lb = img_lb.astype(np.float32) / 255.0
+    img_t = torch.from_numpy(np.transpose(img_lb, (2, 0, 1))).unsqueeze(0).float()
 
-
-def preprocess(img_path, size=(640, 640)):
-    img0 = cv2.imread(img_path)
-    assert img0 is not None, "Image not found"
-
-    h0, w0 = img0.shape[:2]
-
-    img = cv2.resize(img0, size)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype("float32") / 255.0
-    img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
-
-    return img, img0, (w0, h0), size
-
-
-def dfl_decode(reg, reg_max):
-    """
-    reg: (N, 4*(reg_max+1))
-    return: (N, 4)
-    """
-    reg = reg.reshape(-1, 4, reg_max + 1)
-    prob = F.softmax(reg, dim=2)
-    proj = torch.arange(reg_max + 1, device=reg.device).float()
-    return (prob * proj).sum(dim=2)
-
-
-def decode_level(cls, reg, stride, input_size, orig_size):
-    """
-    cls: (1, C, H, W)
-    reg: (1, 4*K, H, W)
-    """
-    B, C, H, W = cls.shape
-    K = reg.shape[1] // 4
-
-    cls = cls.sigmoid().view(C, -1)
-    scores, labels = cls.max(dim=0)
-
-    keep = scores > CONF_THRES
-    if keep.sum() == 0:
-        return None
-
-    scores = scores[keep]
-    labels = labels[keep]
-
-    reg = reg.permute(0, 2, 3, 1).reshape(-1, 4 * K)[keep]
-    dist = dfl_decode(reg, K - 1)
-
-    # ---- IMPORTANT FIX: center + 0.5 ----
-    ys, xs = torch.meshgrid(
-        torch.arange(H, device=reg.device),
-        torch.arange(W, device=reg.device),
-        indexing="ij",
-    )
-    centers = torch.stack((xs + 0.5, ys + 0.5), dim=-1).reshape(-1, 2)
-    centers = centers[keep] * stride
-
-    x1 = centers[:, 0] - dist[:, 0] * stride
-    y1 = centers[:, 1] - dist[:, 1] * stride
-    x2 = centers[:, 0] + dist[:, 2] * stride
-    y2 = centers[:, 1] + dist[:, 3] * stride
-
-    boxes = torch.stack([x1, y1, x2, y2], dim=1)
-
-    # ---- scale back to original image ----
-    iw, ih = input_size
-    ow, oh = orig_size
-
-    scale_x = ow / iw
-    scale_y = oh / ih
-
-    boxes[:, [0, 2]] *= scale_x
-    boxes[:, [1, 3]] *= scale_y
-
-    boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, ow)
-    boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, oh)
-
-    return boxes, scores, labels
+    return img_t, img_bgr, lb_meta
 
 
 @torch.no_grad()
-def main():
-    with open(CFG_PATH, "rb") as f:
+def run_inference(args):
+    with open(args.config, "rb") as f:
         cfg = tomllib.load(f)
 
-    model = MicroDet(cfg["model"]).to(DEVICE).eval()
+    input_size = tuple(cfg.get("model", {}).get("input_size", [640, 640]))
+    device = torch.device("cuda" if torch.cuda.is_available() and args.device == "cuda" else "cpu")
 
-    ckpt = torch.load(CKPT_PATH, map_location="cpu")
-    model.load_state_dict(ckpt["model"], strict=False)
-    print("✔ Loaded weights")
+    model = MicroDet(cfg["model"]).to(device).eval()
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    model.load_state_dict(ckpt.get("model", ckpt), strict=False)
 
-    img_tensor, img0, orig_size, input_size = preprocess(IMAGE_PATH)
-    img_tensor = img_tensor.to(DEVICE)
+    img_t, img_bgr, lb_meta = preprocess_image(args.image, input_size=input_size)
+    img_t = img_t.to(device)
 
-    raw_preds = model(img_tensor)
-    preds = _normalize_preds_for_criterion(raw_preds)
+    preds = canonicalize_preds(model(img_t))
+    det_boxes, det_scores, det_batch = decode_predictions(
+        preds,
+        model=model,
+        conf_thres=float(args.conf_thres),
+        iou_thres=float(args.iou_thres),
+        max_det=int(args.max_det),
+        min_box=float(args.min_box),
+        score_temperature=float(args.score_temperature),
+    )
 
-    all_boxes = []
-    all_scores = []
-
-    for lvl, level_pred in enumerate(preds):
-        decoded = decode_level(
-            level_pred["cls"],
-            level_pred["reg"],
-            STRIDES[lvl],
-            input_size,
-            orig_size,
-        )
-        if decoded is None:
-            continue
-
-        boxes, scores, _ = decoded
-        all_boxes.append(boxes)
-        all_scores.append(scores)
-
-    if len(all_boxes) == 0:
-        print("⚠ No detections")
-        cv2.imwrite(OUT_PATH, img0)
+    if det_boxes.numel() == 0:
+        print("No detections.")
+        cv2.imwrite(args.output, img_bgr)
         return
 
-    boxes = torch.cat(all_boxes)
-    scores = torch.cat(all_scores)
-
-    keep = nms(boxes, scores, NMS_IOU_THRES)
-    boxes = boxes[keep]
-    scores = scores[keep]
+    keep = det_batch == 0
+    boxes = undo_letterbox(det_boxes[keep], lb_meta)
+    scores = det_scores[keep]
 
     for box, score in zip(boxes, scores):
-        x1, y1, x2, y2 = map(int, box.tolist())
-        cv2.rectangle(img0, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        x1, y1, x2, y2 = [int(v) for v in box.tolist()]
+        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(
-            img0,
-            f"{score:.2f}",
+            img_bgr,
+            f"person {float(score):.2f}",
             (x1, max(0, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.55,
             (0, 255, 0),
             2,
+            cv2.LINE_AA,
         )
 
-    cv2.imwrite(OUT_PATH, img0)
-    print(f"✔ Output saved to: {OUT_PATH}")
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(args.output, img_bgr)
+    print(f"Saved: {args.output} | detections={boxes.shape[0]}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser("MicroDet inference")
+    parser.add_argument("--config", type=str, default="microdet.toml")
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--image", type=str, required=True)
+    parser.add_argument("--output", type=str, default="tmp/infer/output.png")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--conf-thres", dest="conf_thres", type=float, default=0.35)
+    parser.add_argument("--iou-thres", dest="iou_thres", type=float, default=0.5)
+    parser.add_argument("--max-det", dest="max_det", type=int, default=100)
+    parser.add_argument("--min-box", dest="min_box", type=float, default=8.0)
+    parser.add_argument("--score-temperature", dest="score_temperature", type=float, default=1.0)
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    run_inference(parse_args())

@@ -65,13 +65,42 @@ class DetectionCriterion(nn.Module):
             cls_b = cls_cat[b]
             reg_b = reg_cat[b]
 
-            (
-                q_targets,
-                pos_mask,
-                ltrb_all,
-                gt_xyxy,
-                *_
-            ) = self.assigner.build_targets(points_all, self.strides, targets[b])
+            assign_out = self.assigner.build_targets(points_all, self.strides, targets[b])
+
+            # Support both:
+            # 1) (q_targets, pos_mask, ltrb_all, gt_xyxy, ...)
+            # 2) (labels, label_weights, bbox_targets, dist_targets, num_pos)
+            if isinstance(assign_out, (list, tuple)) and len(assign_out) >= 4:
+                t0, t1, t2, t3 = assign_out[:4]
+
+                # CenterAssigner style
+                if (
+                    torch.is_tensor(t0)
+                    and torch.is_tensor(t1)
+                    and torch.is_tensor(t2)
+                    and torch.is_tensor(t3)
+                    and t2.ndim == 2
+                    and t3.ndim == 2
+                ):
+                    labels = t0
+                    bbox_targets = t2
+                    dist_targets = t3
+
+                    if labels.dtype in (torch.long, torch.int64, torch.int32):
+                        pos_mask = labels >= 0
+                        q_targets = pos_mask.float()
+                        ltrb_all = dist_targets
+                        gt_xyxy = bbox_targets
+                    else:
+                        # Legacy q-target style
+                        q_targets = t0
+                        pos_mask = t1.bool()
+                        ltrb_all = t2
+                        gt_xyxy = t3
+                else:
+                    raise RuntimeError("Unsupported assigner target format.")
+            else:
+                raise RuntimeError("Assigner must return at least 4 target tensors.")
 
             q_targets = q_targets.to(device).float()
             pos_mask = pos_mask.to(device)

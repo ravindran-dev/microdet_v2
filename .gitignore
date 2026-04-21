@@ -1,4 +1,9 @@
 m_env/
+__pycache__/
+*.py[cod]
+*.pyc.*
+*.pyd
+*.pyo
 tmp/model/__pycache__
 tmp/src/__pycache__
 tmp/assigners/__pycache__/

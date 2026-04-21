@@ -1,7 +1,7 @@
 [model]
 name = "microdet"
 nc = 1
-input_size = [512, 512]
+input_size = [640, 640]
 
 
 [model.scales]
@@ -31,8 +31,8 @@ config = ["CenterAssigner", {"8"  = 4.0,"16" = 4.0,"32" = 4.0}]
 
 [data.train]
 config = [
-    "tmp/data/dataset/images",
-    "tmp/data/dataset/result.json",
+    "src/data/dataset/images",
+    "src/data/dataset/result.json",
     [640, 640],
     true,
     { color_jitter = true }
@@ -40,8 +40,8 @@ config = [
 
 [data.val]
 config = [
-    "tmp/data/dataset/images",
-    "tmp/data/dataset/result.json",
+    "src/data/dataset/images",
+    "src/data/dataset/result.json",
     [640, 640],
     true,
     {}
@@ -70,6 +70,14 @@ max_norm = 1.0
 
 [log]
 interval = 20
+
+[postprocess]
+conf_thres = 0.35
+iou_thres = 0.50
+max_det = 100
+min_box = 8
+score_temperature = 1.0
+
 [resume]
 path = "runs/microdet_drone/last.pth"
 
