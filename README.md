@@ -106,13 +106,13 @@ config = [
 ## Training
 ### Train from scratch
 ```zsh
-python -m tmp.train.train \
+python -m src.train.train \
   --config microdet.toml \
   --device cuda
 ```
 ### Resume training
 ```zsh
-python -m tmp.train.train \
+python -m src.train.train \
   --config microdet.toml \
   --device cuda \
   --resume runs/microdet_drone/weights/last.ckpt
